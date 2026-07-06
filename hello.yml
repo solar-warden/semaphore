@@ -1,0 +1,11 @@
+---
+- name: Hello world
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Provjeri konekciju
+      ansible.builtin.ping:
+
+    - name: Pozdrav s hosta
+      ansible.builtin.debug:
+        msg: "Hello world sa {{ inventory_hostname }}"
