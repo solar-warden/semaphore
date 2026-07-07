@@ -1,6 +1,6 @@
 ---
 - name: Hello world
-  hosts: all
+  hosts: "{{ target | default('all') }}"
   gather_facts: false
   tasks:
     - name: Provjeri konekciju
