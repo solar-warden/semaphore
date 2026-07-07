@@ -1,0 +1,36 @@
+---
+# Uklanjanje nepotrebnih paketa (apt autoremove).
+# Uklanja pakete koji su nekad instalirani kao ovisnost, a vise nisu potrebni.
+# Varijablom 'purge_configs' biras hoce li se ukloniti i konfiguracijske datoteke.
+
+- name: Apt autoremove
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    purge_configs: false   # true = ukloni i .conf datoteke uklonjenih paketa
+
+  tasks:
+    - name: Osvjezi apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Pokreni autoremove
+      ansible.builtin.apt:
+        autoremove: true
+        purge: "{{ purge_configs | bool }}"
+      register: autoremove_result
+
+    - name: Prikazi je li sto uklonjeno
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'uklonjeni paketi — vidi detalje ispod' if autoremove_result.changed
+             else 'nista za ukloniti, sustav je vec cist.' }}
+
+    - name: Prikazi detalje (sto je apt napravio)
+      ansible.builtin.debug:
+        var: autoremove_result.stdout_lines
+      when: autoremove_result.changed
