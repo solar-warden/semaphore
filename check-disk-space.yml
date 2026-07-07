@@ -1,0 +1,81 @@
+---
+# Provjera slobodnog prostora na disku prije nadogradnje.
+# Read-only: nista ne mijenja na sustavu, samo izvjestava.
+# Provjerava /, /var i /boot, svaku sa svojim pragom.
+# Particije koje ne postoje kao zaseban mount se preskacu
+# (npr. ako /var nije odvojen, pokriven je provjerom /).
+
+- name: Provjera prostora na disku
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    # Pragovi minimalnog slobodnog prostora po particiji, u MB.
+    # Prilagodi po potrebi.
+    disk_checks:
+      - mount: /
+        min_free_mb: 1024      # root: prostor za rasplet ovisnosti i opcenito
+      - mount: /var
+        min_free_mb: 1024      # apt preuzima pakete u /var/cache/apt/archives
+      - mount: /boot
+        min_free_mb: 100       # kernel + initrd; vidi napomenu ispod
+
+  tasks:
+    - name: Dohvati podatke o mount pointovima
+      ansible.builtin.setup:
+        filter: ansible_mounts
+
+    - name: Odredi koje od trazenih particija stvarno postoje kao zaseban mount
+      ansible.builtin.set_fact:
+        existing_checks: >-
+          {{ disk_checks
+             | selectattr('mount', 'in', ansible_mounts | map(attribute='mount') | list)
+             | list }}
+
+    - name: Prikazi koje trazene particije NISU zaseban mount (preskacu se)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: nema zasebne particije za
+          {{ (disk_checks | map(attribute='mount') | list)
+             | difference(ansible_mounts | map(attribute='mount') | list) | join(', ') }}
+          — pokriveno nadredjenom particijom, preskacem.
+      when: >-
+        (disk_checks | map(attribute='mount') | list
+         | difference(ansible_mounts | map(attribute='mount') | list)) | length > 0
+
+    - name: Prikazi stanje svake postojece particije
+      vars:
+        m: "{{ ansible_mounts | selectattr('mount', 'equalto', item.mount) | first }}"
+        free_mb: "{{ (m.size_available / 1024 / 1024) | round(0, 'floor') | int }}"
+        used_pct: "{{ (100 - (m.size_available / m.size_total * 100)) | round(1) }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} {{ item.mount }} —
+          slobodno {{ free_mb }} MB ({{ used_pct }}% zauzeto),
+          prag {{ item.min_free_mb }} MB:
+          {{ 'OK' if (free_mb | int) >= (item.min_free_mb | int)
+             else 'PAZNJA — ispod praga!' }}
+      loop: "{{ existing_checks }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    - name: Skupi particije ispod praga
+      vars:
+        m: "{{ ansible_mounts | selectattr('mount', 'equalto', item.mount) | first }}"
+        free_mb: "{{ (m.size_available / 1024 / 1024) | round(0, 'floor') | int }}"
+      ansible.builtin.set_fact:
+        below_threshold: >-
+          {{ below_threshold | default([])
+             + [ item.mount ~ ' (' ~ free_mb ~ ' MB < ' ~ item.min_free_mb ~ ' MB)' ] }}
+      loop: "{{ existing_checks }}"
+      loop_control:
+        label: "{{ item.mount }}"
+      when: >-
+        (ansible_mounts | selectattr('mount', 'equalto', item.mount) | first).size_available
+        < (item.min_free_mb | int * 1024 * 1024)
+
+    - name: Prekini ako je ijedna particija ispod praga
+      ansible.builtin.fail:
+        msg: "Nedovoljno prostora: {{ below_threshold | join(', ') }}"
+      when: (below_threshold | default([])) | length > 0
