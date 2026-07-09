@@ -1,0 +1,144 @@
+---
+# Popravak isteklih/nevaljanih GPG kljuceva repozitorija (EXPKEYSIG / NO_PUBKEY).
+# Za svaki definirani repo radi SAMO ako je taj repo stvarno konfiguriran na hostu.
+# Ako repo nije koristen (nema ga u apt izvorima) — ne dira se nista (no-op).
+#
+# Tijek po repou (samo ako je konfiguriran):
+#   1) provjeri da je repo definiran na ovom serveru (grep po apt izvorima)
+#   2) preuzmi svjezi kljuc (curl ili wget)
+#   3) PROVJERI fingerprint — instalira se samo ako se poklapa s ocekivanim
+#   4) backup starog keyringa, pa instalacija novog na putanju iz 'signed-by='
+# Na kraju: apt-get update radi provjere, samo na hostovima gdje je nesto popravljeno.
+
+- name: Popravak GPG kljuceva repozitorija
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    # keyring       = TOCNA putanja iz 'signed-by=' u .list datoteci
+    # key_url       = HTTPS izvor svjezeg kljuca
+    # fingerprint   = ocekivani fingerprint (sigurnosna brana)
+    # sources_match = niz po kojem se prepoznaje da je repo konfiguriran (URL/host)
+    repo_keys:
+      - name: mysql
+        keyring: /usr/share/keyrings/mysql-community-archive-keyring.gpg
+        key_url: https://repo.mysql.com/RPM-GPG-KEY-mysql-2025
+        fingerprint: BCA43417C3B485DD128EC6D4B7B3B788A8D3785C
+        sources_match: "repo.mysql.com"
+      - name: sury-php
+        keyring: /usr/share/keyrings/deb.sury.org-php.gpg
+        key_url: https://packages.sury.org/php/apt.gpg
+        fingerprint: 15058500A0235D97F5D10063B188E2B695BD4743
+        sources_match: "packages.sury.org"
+
+  tasks:
+    - name: Obradi svaki repo (preskoci ako nije konfiguriran na hostu)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+
+          NAME="{{ item.name }}"
+          URL="{{ item.key_url }}"
+          KEYRING="{{ item.keyring }}"
+          WANT_FPR="{{ item.fingerprint | upper | replace(' ', '') }}"
+          MATCH="{{ item.sources_match }}"
+
+          # 1) Je li repo uopce konfiguriran? Trazimo URL/host ILI putanju keyringa
+          #    u svim apt izvorima (-R pokriva i .list i deb822 .sources datoteke).
+          if ! grep -REqs -e "$MATCH" -e "$KEYRING" \
+               /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+            echo "SKIP: repo '$NAME' nije konfiguriran na ovom serveru — ne diram nista."
+            exit 0
+          fi
+
+          # Repo POSTOJI — potreban alat
+          command -v gpg >/dev/null 2>&1 || { echo "ERROR: gpg (gnupg) nije instaliran"; exit 5; }
+
+          fetch() {
+            if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2";
+            elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1";
+            else echo "ERROR: ni curl ni wget nisu dostupni"; exit 4; fi
+          }
+
+          TMPD="$(mktemp -d)"; export GNUPGHOME="$TMPD"; chmod 700 "$TMPD"
+          trap 'rm -rf "$TMPD"' EXIT
+
+          # 2) preuzmi kljuc
+          fetch "$URL" "$TMPD/key.in"
+
+          # 3) uvezi u privremeni keyring i PROVJERI fingerprint
+          gpg --batch --import "$TMPD/key.in" >/dev/null 2>&1
+          if ! gpg --batch --with-colons --fingerprint \
+               | awk -F: '/^fpr:/ {print $10}' | grep -qiF "$WANT_FPR"; then
+            echo "FINGERPRINT MISMATCH za '$NAME' — kljuc NIJE instaliran."
+            gpg --batch --with-colons --fingerprint | awk -F: '/^fpr:/ {print "  nadjeno: " $10}'
+            echo "  ocekivano: $WANT_FPR"
+            exit 3
+          fi
+
+          # 4) backup + instalacija provjerenog kljuca
+          if [ -f "$KEYRING" ]; then cp -a "$KEYRING" "${KEYRING}.bak.$(date +%Y%m%d%H%M%S)"; fi
+          mkdir -p "$(dirname "$KEYRING")"
+          gpg --batch --export "$WANT_FPR" > "$KEYRING"
+          chmod 0644 "$KEYRING"
+          echo "OK: kljuc za '$NAME' instaliran u $KEYRING (fpr $WANT_FPR)"
+      loop: "{{ repo_keys }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: keyfix
+      changed_when: "'instaliran' in stdout"
+
+    - name: Prikazi sto se dogodilo po repou
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines | default([]) }}"
+      loop: "{{ keyfix.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Odredi koji su repoi stvarno popravljeni na ovom hostu
+      ansible.builtin.set_fact:
+        fixed_repos: >-
+          {{ keyfix.results | selectattr('stdout', 'search', 'instaliran')
+             | map(attribute='item.name') | list }}
+
+    - name: Nema sto za popraviti (svi repoi preskoceni)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: nijedan od definiranih repozitorija nije konfiguriran ovdje — nista ucinjeno."
+      when: (fixed_repos | length) == 0
+
+    - name: Ponovni apt-get update (samo ako je nesto popravljeno)
+      ansible.builtin.command:
+        cmd: apt-get update
+      register: apt_recheck
+      changed_when: false
+      failed_when: false
+      environment:
+        LANG: C
+        LC_ALL: C
+      when: (fixed_repos | length) > 0
+
+    - name: Provjeri jesu li greske s potpisom nestale
+      ansible.builtin.set_fact:
+        still_broken: >-
+          {{ (apt_recheck.stderr_lines + apt_recheck.stdout_lines)
+             | select('search', 'EXPKEYSIG|NO_PUBKEY|signatures were invalid|is not signed')
+             | list }}
+      when: (fixed_repos | length) > 0
+
+    - name: Zavrsni sazetak (za hostove gdje je nesto popravljeno)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} — popravljeno: {{ fixed_repos | join(', ') }}.
+          {{ 'apt update sada bez gresaka potpisa.'
+             if (still_broken | length) == 0
+             else 'JOS IMA problema s potpisom — vidi ispod.' }}
+      when: (fixed_repos | length) > 0
+
+    - name: Preostali problemi (ako ih ima)
+      ansible.builtin.debug:
+        var: still_broken
+      when:
+        - (fixed_repos | length) > 0
+        - (still_broken | length) > 0
