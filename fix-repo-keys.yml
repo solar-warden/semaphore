@@ -34,6 +34,21 @@
         key_urls:
           - "https://packages.sury.org/php/apt.gpg"
           - "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xB188E2B695BD4743"
+      - name: nginx
+        keyring: /usr/share/keyrings/nginx-archive-keyring.gpg
+        fingerprint: 8540A6F18833A80E9C1653A42FD21310B49F6B46
+        sources_match: "nginx.org"
+        key_urls:
+          - "https://nginx.org/keys/nginx_signing.key"
+          - "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2FD21310B49F6B46"
+      - name: mongodb-5.0
+        keyring: /usr/share/keyrings/mongodb-server-5.0.gpg
+        fingerprint: F5679A222C647C87527C2F8CB00A0BD1E2C63C11
+        sources_match: "mongodb-org/5.0"
+        key_urls:
+          - "https://www.mongodb.org/static/pgp/server-5.0.asc"
+          - "https://pgp.mongodb.com/server-5.0.asc"
+          - "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xB00A0BD1E2C63C11"
 
   tasks:
     - name: Obradi svaki repo
