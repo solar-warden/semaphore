@@ -1,0 +1,68 @@
+---
+# Apt update + provjera zdravlja repozitorija.
+# Pokrece 'apt-get update', hvata puni izlaz i trazi znakove problema:
+# nedostupan repo (mreza/DNS), istekli ili nedostajuci PGP kljuc, nepotpisan repo itd.
+# Read-only za sustav (osvjezava samo apt cache), ne instalira nista.
+
+- name: Apt update s provjerom repozitorija
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    # true = task padne (crveno u PLAY RECAP) ako ijedan repo javi problem.
+    # false = samo izvijesti, ne obara host.
+    fail_on_repo_error: true
+
+    # Obrasci koje smatramo problemom u izlazu apt-a.
+    # Pokriva mrezu, DNS, TLS, te PGP/potpis greske (ukljucujuci istekle kljuceve).
+    problem_regex: "Failed to fetch|Could not resolve|Connection failed|Connection timed out|Unable to connect|is not signed|NO_PUBKEY|EXPKEYSIG|KEYEXPIRED|following signatures were invalid|Certificate verification failed|does not have a Release file|Clearsigned file isn't valid"
+
+  tasks:
+    - name: Pokreni apt-get update (hvatam izlaz, ne prekidam odmah)
+      ansible.builtin.command:
+        cmd: apt-get update
+      register: apt_update
+      changed_when: false
+      failed_when: false
+      environment:
+        LANG: C
+        LC_ALL: C
+
+    - name: Izdvoji sumnjive linije iz izlaza (stdout + stderr)
+      ansible.builtin.set_fact:
+        repo_problems: >-
+          {{ (apt_update.stderr_lines + apt_update.stdout_lines)
+             | select('search', problem_regex) | list }}
+
+    - name: Sazetak po hostu
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'SVI repozitoriji OK (apt update bez gresaka).'
+             if (apt_update.rc == 0 and (repo_problems | length) == 0)
+             else 'PROBLEM s repozitorijima — detalji ispod.' }}
+
+    - name: Prikazi konkretne problematicne linije
+      ansible.builtin.debug:
+        var: repo_problems
+      when: (repo_problems | length) > 0
+
+    # Sigurnosna mreza: ako je apt vratio gresku (rc != 0) a obrasci nista nisu uhvatili,
+    # pokazi cijeli stderr da se ne izgubi nepredvidjena greska.
+    - name: Prikazi cijeli stderr ako je apt pao bez prepoznatog obrasca
+      ansible.builtin.debug:
+        var: apt_update.stderr_lines
+      when:
+        - apt_update.rc != 0
+        - (repo_problems | length) == 0
+
+    - name: Prekini ako je bilo problema i tako je trazeno
+      ansible.builtin.fail:
+        msg: >-
+          apt update prijavio problem (rc={{ apt_update.rc }},
+          prepoznatih linija: {{ repo_problems | length }}).
+          Provjeri dostupnost repozitorija i PGP kljuceve.
+      when:
+        - fail_on_repo_error | bool
+        - (apt_update.rc != 0) or ((repo_problems | length) > 0)
