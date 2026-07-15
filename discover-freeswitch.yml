@@ -1,0 +1,55 @@
+---
+# Otkrivanje servera s instaliranim FreeSWITCHem.
+# Read-only: samo provjerava i izvjestava, nista ne mijenja.
+# Na kraju ispisuje popis + gotov YAML blok za inventory grupu.
+
+- name: Popis servera s FreeSWITCHem
+  hosts: "{{ target | default('all') }}"
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Provjeri je li FreeSWITCH instaliran
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          # Instalirani paketi koji se zovu freeswitch* (status 'ii' = installed)
+          VER="$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\n' 'freeswitch*' 2>/dev/null \
+                 | awk -F'\t' '$1 ~ /^ii/ {print $2"="$3}' | paste -sd',' - )"
+          if [ -n "$VER" ]; then
+            echo "INSTALLED $VER"
+          elif command -v freeswitch >/dev/null 2>&1; then
+            echo "INSTALLED (iz izvora, bez paketa) $(freeswitch -version 2>/dev/null | head -n1)"
+          else
+            echo "ABSENT"
+          fi
+      register: fs_check
+      changed_when: false
+      failed_when: false
+
+    - name: Zapamti rezultat po hostu
+      ansible.builtin.set_fact:
+        freeswitch_installed: "{{ ('INSTALLED' in fs_check.stdout) | bool }}"
+        freeswitch_version: "{{ fs_check.stdout | regex_replace('^INSTALLED ?', '') }}"
+
+    - name: Prikazi po hostu
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'FreeSWITCH DA — ' ~ freeswitch_version if freeswitch_installed
+             else 'nema FreeSWITCHa' }}
+
+    - name: Popis i gotov inventory blok
+      run_once: true
+      vars:
+        fs_hosts: >-
+          {{ ansible_play_hosts | map('extract', hostvars)
+             | selectattr('freeswitch_installed', 'defined')
+             | selectattr('freeswitch_installed')
+             | map(attribute='inventory_hostname') | list }}
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['=== Serveri s FreeSWITCHem (' ~ (fs_hosts | length) ~ ') ==='] + fs_hosts
+             + ['', '--- Zalijepi u inventory (YAML) ---', 'freeswitch_nodes:', '  hosts:']
+             + (fs_hosts | map('regex_replace', '^', '    ') | map('regex_replace', '$', ':') | list) }}
