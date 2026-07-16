@@ -20,6 +20,7 @@
     min_calls_to_abort: 1
     abort_if_loaded_module_removed: true   # prekini ako bi se uklonio ucitan modul
     backup_config: true
+    restart_after: true                    # restartaj FreeSWITCH da se aktivira nova verzija
 
   tasks:
     - name: Parametri pokretanja (za history)
@@ -202,6 +203,26 @@
             -o Dpkg::Options::=--force-confdef \
             "{{ fs_trigger }}"
       register: fs_migrate
+
+    - name: Restartaj FreeSWITCH da se aktivira 1.11
+      ansible.builtin.systemd:
+        name: freeswitch
+        state: restarted
+      when:
+        - restart_after | bool
+        - fs_migrate.changed
+
+    - name: Pricekaj da FreeSWITCH ponovno postane active
+      ansible.builtin.command: systemctl is-active freeswitch
+      register: fs_active
+      until: fs_active.stdout == 'active'
+      retries: 10
+      delay: 3
+      changed_when: false
+      failed_when: false
+      when:
+        - restart_after | bool
+        - fs_migrate.changed
 
     - name: Provjeri stanje servisa nakon migracije
       ansible.builtin.shell:
