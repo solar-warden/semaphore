@@ -1,0 +1,66 @@
+---
+# Audit verzija FreeSWITCHa: izlistava sve hostove koji NISU na 1.11.x.
+# Read-only: samo cita instaliranu verziju, nista ne mijenja.
+# Na kraju daje popis + gotov inventory blok grupe 'freeswitch_to_migrate'.
+
+- name: Audit verzija FreeSWITCH (tko nije na 1.11.x)
+  hosts: "{{ target | default('freeswitch_nodes') }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Ocitaj instaliranu verziju FreeSWITCHa
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          # Prvo verzija iz paketa 'freeswitch'
+          VER="$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}\n' freeswitch 2>/dev/null | awk '$1 ~ /^ii/ {print $2; exit}')"
+          # Ako nema tocno 'freeswitch', probaj bilo koji freeswitch* paket
+          if [ -z "${VER:-}" ]; then
+            VER="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'freeswitch*' 2>/dev/null | awk '$1 ~ /^ii/ {print $3; exit}')"
+          fi
+          # Ako i dalje nista (npr. build iz izvora), probaj fs_cli
+          if [ -z "${VER:-}" ] && command -v fs_cli >/dev/null 2>&1; then
+            VER="$(fs_cli -x version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -n1)"
+          fi
+          if [ -n "${VER:-}" ]; then echo "PRESENT $VER"; else echo "ABSENT"; fi
+      register: fs_ver
+      changed_when: false
+      failed_when: false
+
+    - name: Izracunaj status po hostu
+      ansible.builtin.set_fact:
+        fs_present: "{{ 'PRESENT' in fs_ver.stdout }}"
+        fs_version: "{{ (fs_ver.stdout | regex_replace('^PRESENT ', '')) if ('PRESENT' in fs_ver.stdout) else '' }}"
+
+    - name: Izracunaj major.minor i je li 1.11.x
+      ansible.builtin.set_fact:
+        fs_mm: "{{ fs_version | regex_search('^[0-9]+\\.[0-9]+') | default('', true) }}"
+        fs_on_1_11: "{{ fs_version is match('1\\.11\\.') }}"
+
+    - name: Prikazi po hostu
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ ('FreeSWITCH ' ~ fs_version ~ (' — NA 1.11.x' if fs_on_1_11 else ' — NIJE na 1.11.x'))
+             if fs_present else 'nema FreeSWITCHa' }}
+
+    - name: Popis i inventory blok
+      run_once: true
+      vars:
+        hv: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('fs_present', 'defined') | list }}"
+        on_target: "{{ hv | selectattr('fs_present') | selectattr('fs_on_1_11') | map(attribute='inventory_hostname') | list }}"
+        not_on: "{{ hv | selectattr('fs_present') | rejectattr('fs_on_1_11') | map(attribute='inventory_hostname') | list }}"
+        absent: "{{ hv | rejectattr('fs_present') | map(attribute='inventory_hostname') | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['=== FreeSWITCH verzije ===',
+              'NA 1.11.x (' ~ (on_target | length) ~ '): ' ~ (on_target | join(', ')),
+              'NISU na 1.11.x (' ~ (not_on | length) ~ '): ' ~ (not_on | join(', ')),
+              'bez FreeSWITCHa (' ~ (absent | length) ~ '): ' ~ (absent | join(', ')),
+              '',
+              '--- grupa za migraciju (paste pod all.children, grupa=4 razmaka) ---',
+              '    freeswitch_to_migrate:',
+              '      hosts:']
+             + (not_on | map('regex_replace', '^', '        ') | map('regex_replace', '$', ':') | list) }}
