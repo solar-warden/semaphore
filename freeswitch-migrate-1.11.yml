@@ -21,6 +21,7 @@
     abort_if_loaded_module_removed: true   # prekini ako bi se uklonio ucitan modul
     backup_config: true
     restart_after: true                    # restartaj FreeSWITCH da se aktivira nova verzija
+    skip_if_current: true                  # preskoci host ako nema sto za nadograditi
 
   tasks:
     - name: Parametri pokretanja (za history)
@@ -53,8 +54,10 @@
           apt-get update -qq 2>/dev/null || true
           TARGETVER="$(apt-cache policy freeswitch 2>/dev/null | awk '/Candidate:/{print $2}')"
 
-          # simulacija -> koji ce se paketi ukloniti
-          REMOVE="$(apt-get install -y -s "$TRIGGER" 2>/dev/null | awk '/^Remv/ {print $2}' | sort -u | tr '\n' ' ')"
+          # simulacija (jednom) -> uklanjanja + ukupan broj promjena
+          SIM="$(apt-get install -y -s "$TRIGGER" 2>/dev/null)"
+          REMOVE="$(echo "$SIM" | awk '/^Remv/ {print $2}' | sort -u | tr '\n' ' ')"
+          CHANGES="$(echo "$SIM" | grep -cE '^(Inst|Remv) ')"
 
           # trenutno ucitani moduli (best-effort)
           LOADED=""
@@ -79,6 +82,7 @@
 
           echo "TRIGGER $TRIGGER"
           echo "TARGETVER ${TARGETVER:-unknown}"
+          echo "CHANGES ${CHANGES:-0}"
           echo "CALLS $CALLS"
           echo "REMOVE ${REMOVE:-}"
           echo "REMOVE_LOADED ${REMOVE_LOADED:-}"
@@ -90,6 +94,7 @@
       ansible.builtin.set_fact:
         fs_trigger: "{{ (analysis.stdout_lines | select('match','^TRIGGER ') | first | default('TRIGGER freeswitch')) | regex_replace('^TRIGGER ','') }}"
         fs_targetver: "{{ (analysis.stdout_lines | select('match','^TARGETVER ') | first | default('TARGETVER unknown')) | regex_replace('^TARGETVER ','') }}"
+        fs_changes: "{{ (analysis.stdout_lines | select('match','^CHANGES ') | first | default('CHANGES 0')) | regex_replace('^CHANGES ','') }}"
         fs_calls: "{{ (analysis.stdout_lines | select('match','^CALLS ') | first | default('CALLS unknown')) | regex_replace('^CALLS ','') }}"
         fs_remove: "{{ ((analysis.stdout_lines | select('match','^REMOVE ') | first | default('REMOVE ')) | regex_replace('^REMOVE ?','')).split() }}"
         fs_remove_loaded: "{{ ((analysis.stdout_lines | select('match','^REMOVE_LOADED') | first | default('REMOVE_LOADED')) | regex_replace('^REMOVE_LOADED ?','')).split() }}"
@@ -107,6 +112,19 @@
     - name: Prekid — dry_run (samo analiza)
       ansible.builtin.meta: end_host
       when: dry_run | bool
+
+    - name: Obavijest — vec na najnovijoj verziji (nema sto za nadograditi)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: vec na najnovijoj verziji ({{ ver_before.stdout | default('?') }}) — preskacem (0 promjena)."
+      when:
+        - skip_if_current | bool
+        - (fs_changes | int) == 0
+
+    - name: Preskoci host ako nema sto za nadograditi
+      ansible.builtin.meta: end_host
+      when:
+        - skip_if_current | bool
+        - (fs_changes | int) == 0
 
     # ---------- SIGURNOSNE BRANE (samo kad dry_run=false) ----------
     - name: Prekini ako ima aktivnih poziva
@@ -210,7 +228,7 @@
         state: restarted
       when:
         - restart_after | bool
-        - fs_migrate.changed
+        - (fs_changes | int) > 0
 
     - name: Pricekaj da FreeSWITCH ponovno postane active
       ansible.builtin.command: systemctl is-active freeswitch
@@ -222,7 +240,7 @@
       failed_when: false
       when:
         - restart_after | bool
-        - fs_migrate.changed
+        - (fs_changes | int) > 0
 
     - name: Provjeri stanje servisa nakon migracije
       ansible.builtin.shell:
