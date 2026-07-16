@@ -1,0 +1,231 @@
+---
+# Migracija FreeSWITCHa na 1.11.x preko binarnog repoa (auth.conf vec postavljen).
+# Ovo NIJE obicni upgrade: 1.11 uklanja dio modula i mijenja regex engine (PCRE2),
+# pa playbook prvo ANALIZIRA sto ce se dogoditi, a mijenja tek kad dry_run=false.
+#
+# Zastite: dry_run (default), backup /etc/freeswitch, provjera aktivnih poziva,
+# prekid ako bi se uklonio TRENUTNO UCITAN modul, serial=1 (host po host).
+#
+# PAZNJA: nadogradnja restarta FreeSWITCH (prekid poziva). Radi u prozoru odrzavanja.
+
+- name: Migracija FreeSWITCH na 1.11
+  hosts: "{{ target | default('freeswitch_to_migrate') }}"
+  become: true
+  gather_facts: false
+  serial: "{{ fs_serial | default(1) }}"
+
+  vars:
+    dry_run: true                          # true = samo analiza; false = stvarna migracija
+    abort_if_active_calls: true
+    min_calls_to_abort: 1
+    abort_if_loaded_module_removed: true   # prekini ako bi se uklonio ucitan modul
+    backup_config: true
+
+  tasks:
+    - name: Parametri pokretanja (za history)
+      ansible.builtin.debug:
+        msg: "host={{ inventory_hostname }} | dry_run={{ dry_run }} | serial={{ fs_serial | default(1) }}"
+
+    - name: Verzija PRIJE
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: "dpkg-query -W -f='${Version}' freeswitch 2>/dev/null || true"
+      register: ver_before
+      changed_when: false
+      failed_when: false
+
+    # ---------- ANALIZA (read-only) ----------
+    - name: Analiza migracije (ciljna verzija, uklanjanja, ucitani moduli, pozivi)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # koji paket je "okidac" nadogradnje
+          if dpkg-query -W -f='${db:Status-Abbrev}' freeswitch-meta-all 2>/dev/null | grep -q '^ii'; then
+            TRIGGER=freeswitch-meta-all
+          else
+            TRIGGER=freeswitch
+          fi
+
+          apt-get update -qq 2>/dev/null || true
+          TARGETVER="$(apt-cache policy freeswitch 2>/dev/null | awk '/Candidate:/{print $2}')"
+
+          # simulacija -> koji ce se paketi ukloniti
+          REMOVE="$(apt-get install -y -s "$TRIGGER" 2>/dev/null | awk '/^Remv/ {print $2}' | sort -u | tr '\n' ' ')"
+
+          # trenutno ucitani moduli (best-effort)
+          LOADED=""
+          if command -v fs_cli >/dev/null 2>&1; then
+            LOADED="$(fs_cli -x 'show modules' 2>/dev/null | grep -oE 'mod_[a-z0-9_]+' | sort -u)"
+          fi
+
+          # koji od modula-za-uklanjanje su trenutno ucitani
+          REMOVE_LOADED=""
+          for p in $REMOVE; do
+            m="mod_$(echo "$p" | sed 's/^freeswitch-mod-//; s/-/_/g')"
+            if echo "$LOADED" | grep -qx "$m"; then REMOVE_LOADED="$REMOVE_LOADED $m"; fi
+          done
+
+          # aktivni pozivi
+          if command -v fs_cli >/dev/null 2>&1; then
+            CALLS="$(fs_cli -x 'show calls count' 2>/dev/null | grep -oE '^[0-9]+' | head -n1)"
+            CALLS="${CALLS:-unknown}"
+          else
+            CALLS="no-fs_cli"
+          fi
+
+          echo "TRIGGER $TRIGGER"
+          echo "TARGETVER ${TARGETVER:-unknown}"
+          echo "CALLS $CALLS"
+          echo "REMOVE ${REMOVE:-}"
+          echo "REMOVE_LOADED ${REMOVE_LOADED:-}"
+      register: analysis
+      changed_when: false
+      failed_when: false
+
+    - name: Rasclani analizu
+      ansible.builtin.set_fact:
+        fs_trigger: "{{ (analysis.stdout_lines | select('match','^TRIGGER ') | first | default('TRIGGER freeswitch')) | regex_replace('^TRIGGER ','') }}"
+        fs_targetver: "{{ (analysis.stdout_lines | select('match','^TARGETVER ') | first | default('TARGETVER unknown')) | regex_replace('^TARGETVER ','') }}"
+        fs_calls: "{{ (analysis.stdout_lines | select('match','^CALLS ') | first | default('CALLS unknown')) | regex_replace('^CALLS ','') }}"
+        fs_remove: "{{ ((analysis.stdout_lines | select('match','^REMOVE ') | first | default('REMOVE ')) | regex_replace('^REMOVE ?','')).split() }}"
+        fs_remove_loaded: "{{ ((analysis.stdout_lines | select('match','^REMOVE_LOADED') | first | default('REMOVE_LOADED')) | regex_replace('^REMOVE_LOADED ?','')).split() }}"
+
+    - name: Prikazi plan migracije
+      ansible.builtin.debug:
+        msg:
+          - "host: {{ inventory_hostname }}"
+          - "verzija sada: {{ ver_before.stdout | default('?') }}  ->  ciljna: {{ fs_targetver }}"
+          - "okidac: {{ fs_trigger }}"
+          - "aktivni pozivi: {{ fs_calls }}"
+          - "UKLANJA SE ({{ fs_remove | length }}): {{ fs_remove | join(', ') if fs_remove else '(nista)' }}"
+          - "!!! UKLANJA SE a TRENUTNO UCITANO ({{ fs_remove_loaded | length }}): {{ fs_remove_loaded | join(', ') if fs_remove_loaded else '(nista)' }}"
+
+    - name: Prekid — dry_run (samo analiza)
+      ansible.builtin.meta: end_host
+      when: dry_run | bool
+
+    # ---------- SIGURNOSNE BRANE (samo kad dry_run=false) ----------
+    - name: Prekini ako ima aktivnih poziva
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }}: {{ fs_calls }} aktivnih poziva — prekidam prije migracije."
+      when:
+        - abort_if_active_calls | bool
+        - fs_calls | regex_search('^[0-9]+')
+        - (fs_calls | int) >= (min_calls_to_abort | int)
+
+    - name: Prekini ako bi se uklonio trenutno ucitan modul
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }}: migracija bi uklonila ucitane module:
+          {{ fs_remove_loaded | join(', ') }}.
+          Rijesi ovisnost (ukloni iz konfiguracije ili nadji zamjenu) pa ponovi,
+          ili postavi abort_if_loaded_module_removed=false ako je namjerno.
+      when:
+        - abort_if_loaded_module_removed | bool
+        - fs_remove_loaded | length > 0
+
+    # ---------- PRIPREMA ----------
+    - name: Backup /etc/freeswitch
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          [ -d /etc/freeswitch ] || { echo "nema /etc/freeswitch"; exit 0; }
+          ts="$(date +%Y%m%d-%H%M%S)"
+          mkdir -p /var/backups
+          f="/var/backups/freeswitch-etc-${ts}.tgz"
+          tar czf "$f" -C /etc freeswitch
+          echo "$f"
+      register: fs_backup
+      changed_when: "'/var/backups/' in fs_backup.stdout"
+      when: backup_config | bool
+
+    - name: voicebrowser override — provjera
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          if dpkg-query -W -f='${db:Status-Abbrev}' 'voicebrowser*' 2>/dev/null | grep -q '^ii' \
+             || command -v voicebrowser >/dev/null 2>&1; then vb=yes; else vb=no; fi
+          f=/etc/systemd/system/freeswitch.service.d/override.conf
+          if [ -f "$f" ] && grep -q 'GROUP=daemon' "$f"; then ov=present; else ov=absent; fi
+          echo "$vb $ov"
+      register: vb_state
+      changed_when: false
+      failed_when: false
+
+    - name: Kreiraj drop-in direktorij (voicebrowser)
+      ansible.builtin.file:
+        path: /etc/systemd/system/freeswitch.service.d
+        state: directory
+        mode: '0755'
+      when: vb_state.stdout.split()[0] == 'yes' and vb_state.stdout.split()[1] == 'absent'
+
+    - name: Postavi GROUP=daemon override (voicebrowser)
+      ansible.builtin.blockinfile:
+        path: /etc/systemd/system/freeswitch.service.d/override.conf
+        create: true
+        mode: '0644'
+        marker: "# {mark} ANSIBLE voicebrowser GROUP override"
+        block: |
+          [Service]
+          Environment="GROUP=daemon"
+      register: vb_applied
+      when: vb_state.stdout.split()[0] == 'yes' and vb_state.stdout.split()[1] == 'absent'
+
+    - name: daemon-reload nakon override-a
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: vb_applied.changed | default(false)
+
+    - name: Ocisti eventualno nedovrseno stanje paketa
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          dpkg --configure -a || true
+          apt-get -f install -y || true
+      changed_when: false
+
+    # ---------- MIGRACIJA ----------
+    - name: Nadogradi FreeSWITCH na 1.11 (dozvoli uklanjanja, zadrzi configove)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y \
+            -o Dpkg::Options::=--force-confold \
+            -o Dpkg::Options::=--force-confdef \
+            "{{ fs_trigger }}"
+      register: fs_migrate
+
+    - name: Provjeri stanje servisa nakon migracije
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          systemctl is-active freeswitch 2>/dev/null || true
+          command -v fs_cli >/dev/null 2>&1 && fs_cli -x status 2>/dev/null | head -n 3 || true
+      register: fs_status
+      changed_when: false
+      failed_when: false
+
+    - name: Verzija NAKON
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: "dpkg-query -W -f='${Version}' freeswitch 2>/dev/null || true"
+      register: ver_after
+      changed_when: false
+      failed_when: false
+
+    - name: Sazetak migracije
+      ansible.builtin.debug:
+        msg:
+          - "host: {{ inventory_hostname }}"
+          - "verzija: {{ ver_before.stdout | default('?') }}  ->  {{ ver_after.stdout | default('?') }}"
+          - "backup: {{ fs_backup.stdout | default('(preskocen)') }}"
+          - "uklonjeno modula: {{ fs_remove | length }}"
+          - "servis nakon: {{ fs_status.stdout_lines | default([]) }}"
