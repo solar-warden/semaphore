@@ -1,0 +1,68 @@
+---
+- name: Kreiraj ansible usera
+  hosts: "{{ target | default('all') }}"
+  become: true
+  vars:
+    # Javni kljuc ansible korisnika: cita se iz datoteke NA KONTROLERU (Semaphore serveru).
+    # Ako radije proslijedis sadrzaj kljuca (npr. survey/var), postavi ansible_pub_key
+    # i on ce se koristiti umjesto citanja datoteke.
+    ansible_pub_key_path: "/live/ansible/keys/ansible_key.pub"
+    ansible_pub_key: ""
+
+  tasks:
+    - name: Provjeri postoji li vec korisnik ansible
+      ansible.builtin.command: getent passwd ansible
+      register: ansible_user_check
+      changed_when: false
+      failed_when: false
+
+    - name: ansible user vec postoji — preskacem
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: korisnik 'ansible' vec postoji ({{ ansible_user_check.stdout }}) — ne mijenjam nista."
+      when: ansible_user_check.rc == 0
+
+    - name: Preskoci ostatak ako korisnik postoji
+      ansible.builtin.meta: end_host
+      when: ansible_user_check.rc == 0
+
+    # --- odavde nadalje samo za hostove gdje korisnik NE postoji ---
+
+    - name: Kreiraj korisnika ansible
+      ansible.builtin.user:
+        name: ansible
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Kreiraj .ssh direktorij
+      ansible.builtin.file:
+        path: /home/ansible/.ssh
+        state: directory
+        owner: ansible
+        group: ansible
+        mode: '0700'
+
+    - name: Kopiraj javni kljuc
+      ansible.builtin.authorized_key:
+        user: ansible
+        key: "{{ ansible_pub_key if (ansible_pub_key | length > 0) else lookup('file', ansible_pub_key_path) }}"
+        state: present
+
+    - name: Postavi passwordless sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/ansible
+        content: "ansible ALL=(ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Provjeri da korisnik ansible postoji
+      ansible.builtin.command:
+        cmd: id ansible
+      register: user_check
+      changed_when: false
+
+    - name: Ispisi rezultat
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: ansible user uspjesno kreiran: {{ user_check.stdout }}"
