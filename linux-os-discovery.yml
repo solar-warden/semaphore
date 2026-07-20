@@ -13,6 +13,61 @@
   tasks:
     - name: "Ocitaj OS (os-release / redhat-release / FreeBSD / uname)"
       ansible.builtin.raw: |
+        /bin/sh -c 'if [ -r /etc/os-release ]; then . /etc/os-release; OUT="${ID:-unknown} ${VERSION_ID:-unknown} ${PRETTY_NAME:-$ID $VERSION_ID}"; elif [ -r /etc/redhat-release ]; then rel=`cat /etc/redhat-release`; ver=`echo "$rel" | grep -oE "[0-9]+([.][0-9]+)*" | head -n1`; if echo "$rel" | grep -qi centos; then id=centos; elif echo "$rel" | grep -qi "red hat"; then id=rhel; elif echo "$rel" | grep -qi fedora; then id=fedora; else id=linux; fi; OUT="$id ${ver:-unknown} $rel"; elif [ "`uname -s`" = "FreeBSD" ]; then ver=`freebsd-version 2>/dev/null || uname -r`; OUT="freebsd $ver FreeBSD $ver"; elif command -v lsb_release >/dev/null 2>&1; then OUT="`lsb_release -si` `lsb_release -sr` `lsb_release -sd`"; else OUT="`uname -s` `uname -r` `uname -s` `uname -r`"; fi; echo "OSINFO $OUT"'
+      register: os_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Izvuci samo oznacenu liniju (ignoriraj sum iz profila/bannera)
+      ansible.builtin.set_fact:
+        os_fields: "{{ ((os_raw.stdout_lines | default([]) | select('match','^OSINFO ') | first | default('')) | regex_replace('^OSINFO ','')).split() }}"
+      when:
+        - os_raw is not unreachable
+        - (os_raw.stdout_lines | default([]) | select('match','^OSINFO ') | list | length) > 0
+
+    - name: Izracunaj OS grupu (npr. debian12)
+      ansible.builtin.set_fact:
+        os_id: "{{ os_fields[0] }}"
+        os_ver: "{{ os_fields[1] }}"
+        os_group: "{{ os_fields[0] ~ (os_fields[1].split('.')[0]) }}"
+        os_pretty: "{{ os_fields[2:] | join(' ') }}"
+      when:
+        - os_fields is defined
+        - (os_fields | length) >= 2
+
+    - name: Prikazi po hostu
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ (os_pretty ~ '  [grupa: ' ~ os_group ~ ']') if os_group is defined else 'OS nepoznat / nedostupan' }}"
+
+    - name: Ispisi blok za svaku OS grupu
+      run_once: true
+      vars:
+        reachable: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('os_group', 'defined') | list }}"
+        groups_found: "{{ reachable | map(attribute='os_group') | unique | sort | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['    ' ~ item ~ ':', '      hosts:']
+             + (reachable | selectattr('os_group','equalto', item)
+                | map(attribute='inventory_hostname')
+                | map('regex_replace','^','        ')
+                | map('regex_replace','$',':') | list) }}
+      loop: "{{ (ansible_play_hosts | map('extract', hostvars) | selectattr('os_group','defined') | map(attribute='os_group') | unique | sort | list) }}"
+      loop_control:
+        label: "{{ item }}"---
+# Otkrivanje tipa/verzije OS-a i grupiranje po OS-u.
+# Read-only, shell-agnosticno (radi i kad je root shell csh, npr. FreeBSD).
+# Izvori (redom): /etc/os-release, /etc/redhat-release (CentOS/RHEL), FreeBSD
+# (freebsd-version/uname), lsb_release, te goli uname kao zadnja opcija.
+# Grupe se imenuju kao <id><major>, npr. debian12, centos7, freebsd12.
+
+- name: Linux OS discovery
+  hosts: "{{ target | default('all') }}"
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: "Ocitaj OS (os-release / redhat-release / FreeBSD / uname)"
+      ansible.builtin.raw: |
         /bin/sh -c 'if [ -r /etc/os-release ]; then . /etc/os-release; echo "${ID:-unknown} ${VERSION_ID:-unknown} ${PRETTY_NAME:-$ID $VERSION_ID}"; elif [ -r /etc/redhat-release ]; then rel=`cat /etc/redhat-release`; ver=`echo "$rel" | grep -oE "[0-9]+([.][0-9]+)*" | head -n1`; if echo "$rel" | grep -qi centos; then id=centos; elif echo "$rel" | grep -qi "red hat"; then id=rhel; elif echo "$rel" | grep -qi fedora; then id=fedora; else id=linux; fi; echo "$id ${ver:-unknown} $rel"; elif [ "`uname -s`" = "FreeBSD" ]; then ver=`freebsd-version 2>/dev/null || uname -r`; echo "freebsd $ver FreeBSD $ver"; elif command -v lsb_release >/dev/null 2>&1; then echo "`lsb_release -si` `lsb_release -sr` `lsb_release -sd`"; else echo "`uname -s` `uname -r` `uname -s` `uname -r`"; fi'
       register: os_raw
       changed_when: false
