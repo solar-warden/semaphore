@@ -1,0 +1,103 @@
+---
+# Detekcija instaliranog softvera i grupiranje u inventory grupe.
+# Read-only. Za svaki host provjeri svaki softver preko tri signala:
+#   paket (dpkg), binary (PATH + sbin), systemd unit.
+# Na kraju: gotovi inventory blokovi po ciljnoj grupi.
+#
+# NAPOMENA za custom softver (voicebrowser, agentproxy, media-file-management):
+# detekcija je pretpostavka (paket/binary/unit istog imena). Ako su instalirani
+# drugacije (npr. u /opt ili drugi naziv servisa), prilagodi 'pkgs/bins/units'.
+
+- name: Grupiranje servera po instaliranom softveru
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+
+  vars:
+    services:
+      - name: docker
+        group: docker
+        pkgs: ['docker-ce', 'docker.io', 'docker-ce-cli']
+        bins: ['docker']
+        units: ['docker.service']
+      - name: voicebrowser
+        group: live20-media
+        pkgs: ['voicebrowser*']
+        bins: ['voicebrowser']
+        units: ['voicebrowser.service']
+      - name: mongodb
+        group: mongo
+        pkgs: ['mongodb-org-server', 'mongodb-org', 'mongodb-server*']
+        bins: ['mongod']
+        units: ['mongod.service', 'mongodb.service']
+      - name: mysql
+        group: mysql
+        pkgs: ['mysql-server*', 'mysql-community-server*', 'mariadb-server*']
+        bins: ['mysqld', 'mariadbd']
+        units: ['mysql.service', 'mariadb.service']
+      - name: postgresql
+        group: postgresql
+        pkgs: ['postgresql', 'postgresql-1*', 'postgresql-9*']
+        bins: ['pg_lsclusters', 'postgres']
+        units: ['postgresql.service']
+      - name: agentproxy
+        group: live20-app
+        pkgs: ['agentproxy*']
+        bins: ['agentproxy']
+        units: ['agentproxy.service']
+      - name: media-file-management
+        group: live30-media
+        pkgs: ['media-file-management*']
+        bins: ['media-file-management', 'media_file_management']
+        units: ['media-file-management.service']
+
+  tasks:
+    - name: Detektiraj svaki softver
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -f
+          found=no
+          for g in {{ item.pkgs | join(' ') }}; do
+            dpkg-query -W -f='${db:Status-Abbrev}\n' "$g" 2>/dev/null | grep -q '^ii' && found=yes
+          done
+          for b in {{ item.bins | join(' ') }}; do
+            for p in "$b" "/usr/sbin/$b" "/sbin/$b" "/usr/local/bin/$b" "/usr/local/sbin/$b"; do
+              { command -v "$p" >/dev/null 2>&1 || [ -x "$p" ]; } && found=yes
+            done
+          done
+          for u in {{ item.units | join(' ') }}; do
+            systemctl list-unit-files "$u" 2>/dev/null | grep -q "$u" && found=yes
+            systemctl status "$u" >/dev/null 2>&1 && found=yes
+          done
+          echo "$found"
+      loop: "{{ services }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: svc_check
+      changed_when: false
+      failed_when: false
+
+    - name: Sazmi u koje grupe host spada
+      ansible.builtin.set_fact:
+        host_matched_groups: "{{ svc_check.results | selectattr('stdout','defined') | selectattr('stdout','equalto','yes') | map(attribute='item.group') | list }}"
+
+    - name: Prikazi po hostu
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ host_matched_groups | join(', ') if host_matched_groups else '(nista od trazenog)' }}"
+
+    - name: Ispisi inventory blok za svaku grupu
+      run_once: true
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['    ' ~ item.group ~ ':', '      hosts:']
+             + (ansible_play_hosts | map('extract', hostvars)
+                | selectattr('host_matched_groups','defined')
+                | selectattr('host_matched_groups','contains', item.group)
+                | map(attribute='inventory_hostname')
+                | map('regex_replace','^','        ')
+                | map('regex_replace','$',':') | list) }}
+      loop: "{{ services }}"
+      loop_control:
+        label: "{{ item.group }}"
