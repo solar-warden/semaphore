@@ -1,0 +1,53 @@
+---
+# Otkrivanje tipa/verzije Linux OS-a i grupiranje po OS-u.
+# Read-only. Cita /etc/os-release preko raw (ne treba Python na cilju).
+# Na kraju: popis po hostu + gotovi inventory blokovi po OS grupi (npr. debian11/12/13).
+
+- name: Linux OS discovery
+  hosts: "{{ target | default('all') }}"
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Ocitaj /etc/os-release (raw)
+      ansible.builtin.raw: ". /etc/os-release 2>/dev/null; echo \"${ID:-unknown} ${VERSION_ID:-unknown} ${PRETTY_NAME:-unknown}\""
+      register: os_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Rasclani OS podatke (samo za dosegnute)
+      ansible.builtin.set_fact:
+        os_fields: "{{ (os_raw.stdout | trim).split() }}"
+      when:
+        - os_raw is not unreachable
+        - (os_raw.stdout | default('') | trim) != ''
+
+    - name: Izracunaj OS grupu (npr. debian12)
+      ansible.builtin.set_fact:
+        os_id: "{{ os_fields[0] }}"
+        os_ver: "{{ os_fields[1] }}"
+        os_group: "{{ os_fields[0] ~ (os_fields[1].split('.')[0]) }}"
+        os_pretty: "{{ os_fields[2:] | join(' ') }}"
+      when:
+        - os_fields is defined
+        - (os_fields | length) >= 2
+
+    - name: Prikazi po hostu
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ (os_pretty ~ '  [grupa: ' ~ os_group ~ ']') if os_group is defined else 'OS nepoznat / nedostupan' }}"
+
+    - name: Ispisi blok za svaku OS grupu
+      run_once: true
+      vars:
+        reachable: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('os_group', 'defined') | list }}"
+        groups_found: "{{ reachable | map(attribute='os_group') | unique | sort | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['    ' ~ item ~ ':', '      hosts:']
+             + (reachable | selectattr('os_group','equalto', item)
+                | map(attribute='inventory_hostname')
+                | map('regex_replace','^','        ')
+                | map('regex_replace','$',':') | list) }}
+      loop: "{{ (ansible_play_hosts | map('extract', hostvars) | selectattr('os_group','defined') | map(attribute='os_group') | unique | sort | list) }}"
+      loop_control:
+        label: "{{ item }}"
