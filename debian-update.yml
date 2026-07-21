@@ -1,0 +1,81 @@
+---
+# Nadogradnja Debian paketa (bilo koja Debian verzija: 10/11/12/13...).
+# Ne-Debian hostovi (CentOS/RHEL/FreeBSD...) se uredno preskacu.
+# Pokreće se preko Semaphore Task Templatea.
+# Ponašanje se kontrolira varijablama (upgrade_type, allow_reboot, upgrade_serial).
+#
+# SIGURAN DEFAULT: bez zadanog 'target' radi na 'debian_svi:!produkcija'
+# (svi Debiani OSIM produkcije). Za produkciju eksplicitno postavi target=produkcija.
+
+- name: Nadogradnja Debian paketa
+  hosts: "{{ target | default('debian_svi:!produkcija') }}"
+  become: true
+
+  # Koliko hostova odjednom. '100%' = svi paralelno; '1' ili '25%' = postupno,
+  # da ne padne cijela flota istovremeno ako nešto krene po zlu.
+  serial: "{{ upgrade_serial | default('100%') }}"
+
+  vars:
+    # safe  -> ne uklanja pakete (najsigurnije, ali može zadržati poneki update)
+    # full  -> apt full-upgrade (rješava ovisnosti, može ukloniti/instalirati pakete)
+    # dist  -> apt dist-upgrade (slično full, uključuje i kernel)
+    upgrade_type: safe
+
+    autoremove: true       # ukloni pakete koji više nisu potrebni
+    autoclean: true        # očisti stari cache preuzetih .deb paketa
+    allow_reboot: false    # smije li playbook rebootati host ako je potrebno
+    reboot_timeout: 600    # koliko sekundi čekati da se host vrati nakon reboota
+
+  tasks:
+    - name: Preskoci ne-Debian host (nema apt)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_major_version'] }} nije Debian — preskacem."
+      when: ansible_facts['distribution'] != 'Debian'
+
+    - name: Zavrsi na ne-Debian hostu
+      ansible.builtin.meta: end_host
+      when: ansible_facts['distribution'] != 'Debian'
+
+    - name: Potvrdi Debian (bilo koja verzija)
+      ansible.builtin.debug:
+        msg: "Debian {{ ansible_facts['distribution_major_version'] }} potvrdjen, nastavljam."
+
+    - name: Osvježi apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Nadogradi pakete ({{ upgrade_type }})
+      ansible.builtin.apt:
+        upgrade: "{{ upgrade_type }}"
+      register: apt_upgrade
+
+    - name: Ukloni nepotrebne pakete (autoremove)
+      ansible.builtin.apt:
+        autoremove: true
+      when: autoremove | bool
+
+    - name: Očisti stari cache (autoclean)
+      ansible.builtin.apt:
+        autoclean: true
+      when: autoclean | bool
+
+    - name: Provjeri traži li sustav reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Prikaži status reboota
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'REBOOT POTREBAN (npr. novi kernel)'
+             if reboot_required_file.stat.exists
+             else 'Reboot nije potreban.' }}
+
+    - name: Rebootaj ako je potrebno i dopušteno
+      ansible.builtin.reboot:
+        msg: "Reboot pokrenut iz Semaphore/Ansible nakon nadogradnje"
+        reboot_timeout: "{{ reboot_timeout }}"
+      when:
+        - allow_reboot | bool
+        - reboot_required_file.stat.exists
