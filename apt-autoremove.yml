@@ -4,7 +4,7 @@
 # Varijablom 'purge_configs' biras hoce li se ukloniti i konfiguracijske datoteke.
 
 - name: Apt autoremove
-  hosts: "{{ target | default('all') }}"
+  hosts: "{{ target | default('debian_svi:!produkcija') }}"
   become: true
   gather_facts: false
 
