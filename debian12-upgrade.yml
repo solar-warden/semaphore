@@ -5,7 +5,7 @@
 # koje se mogu postaviti u Extra Variables ili Survey Variables u Semaphoreu.
 
 - name: Nadogradnja Debian 12 paketa
-  hosts: "{{ target | default('all') }}"
+  hosts: "{{ target | default('debian_svi:!produkcija') }}"
   become: true
 
   # Koliko hostova odjednom. '100%' = svi paralelno; '1' ili '25%' = postupno,
