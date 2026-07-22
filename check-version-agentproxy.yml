@@ -4,7 +4,7 @@
 # Default target je 'live20-app' (moze se nadjaci sa survey/extra var 'target').
 
 - name: Provjera verzije agentproxy
-  hosts: "{{ target | default('live20-app') }}"
+  hosts: "{{ target | default('live20_app') }}"
   become: true
   gather_facts: false
   ignore_unreachable: true
