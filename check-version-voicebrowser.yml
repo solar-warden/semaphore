@@ -4,7 +4,7 @@
 # Default target je 'live20-media' (moze se nadjaci sa survey/extra var 'target').
 
 - name: Provjera verzije voicebrowser
-  hosts: "{{ target | default('live20-media') }}"
+  hosts: "{{ target | default('live20_media') }}"
   become: true
   gather_facts: false
   ignore_unreachable: true
