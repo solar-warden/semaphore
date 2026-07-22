@@ -1,0 +1,121 @@
+---
+# Nadogradnja: PostgreSQL  (SAMO unutar iste serije/major -- security patch, bez skoka major verzije).
+# Read-safe: prekida ako bi kandidat verzija promijenila major-seriju.
+# Ne dira host ako je vec na najnovijoj patch verziji (nema nepotrebnog restarta).
+#
+# Restart baze je potreban da se patch aktivira (kao i kod vecine servisa) -> restart_after.
+# PAZNJA: restart baze = kratki prekid. serial=1, default target iskljucuje produkciju.
+
+- name: Nadogradnja PostgreSQL (unutar serije)
+  hosts: "{{ target | default('postgresql:!produkcija') }}"
+  become: true
+  gather_facts: false
+  serial: "{{ db_serial | default(1) }}"
+
+  vars:
+    dry_run: false            # true = samo prikazi plan, ne mijenjaj
+    restart_after: true       # restartaj servis da se patch aktivira
+    services: ['postgresql']      # kandidati systemd servisa (restarta se onaj koji postoji)
+
+  tasks:
+    - name: Analiza (instalirana/kandidat verzija, serija, paketi)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          PKGS=""
+          for g in 'postgresql' 'postgresql-*'; do
+            PKGS="$PKGS $(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' "$g" 2>/dev/null | awk '$1 ~ /^ii/{print $2}')"
+          done
+          PKGS=$(echo $PKGS | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')
+          if [ -z "$(echo $PKGS | tr -d ' ')" ]; then echo "RESULT ABSENT"; exit 0; fi
+          MAIN=""
+          for m in postgresql; do
+            if dpkg-query -W -f='${db:Status-Abbrev}' "$m" 2>/dev/null | grep -q '^ii'; then MAIN="$m"; break; fi
+          done
+          [ -z "$MAIN" ] && MAIN=$(echo "$PKGS" | tr ' ' '\n' | grep -E '^postgresql-[0-9]+$' | head -n1)
+          [ -z "$MAIN" ] && MAIN=$(echo "$PKGS" | tr ' ' '\n' | head -n1)
+          series() { echo "$1" | sed -E 's/^[0-9]+://' | grep -oE '[0-9]+(\.[0-9]+)*' | head -n1 | cut -d. -f1-1; }
+          apt-get update -qq 2>/dev/null || true
+          INST=$(dpkg-query -W -f='${Version}' "$MAIN" 2>/dev/null)
+          CAND=$(apt-cache policy "$MAIN" 2>/dev/null | awk '/Candidate:/{print $2}')
+          echo "RESULT PRESENT"
+          echo "MAIN $MAIN"
+          echo "INSTALLED ${INST:-unknown}"
+          echo "CANDIDATE ${CAND:-none}"
+          echo "SERIES_INST $(series "$INST")"
+          echo "SERIES_CAND $(series "$CAND")"
+          echo "PKGS $PKGS"
+      register: a
+      changed_when: false
+      failed_when: false
+
+    - name: Preskoci ako PostgreSQL nije instaliran
+      ansible.builtin.meta: end_host
+      when: (a.stdout_lines | default([]) | select('match','^RESULT ABSENT') | list | length) > 0 or a is unreachable
+
+    - name: Rasclani analizu
+      ansible.builtin.set_fact:
+        db_installed: "{{ (a.stdout_lines | select('match','^INSTALLED ') | first | default('INSTALLED ?')) | regex_replace('^INSTALLED ','') }}"
+        db_candidate: "{{ (a.stdout_lines | select('match','^CANDIDATE ') | first | default('CANDIDATE none')) | regex_replace('^CANDIDATE ','') }}"
+        db_series_inst: "{{ (a.stdout_lines | select('match','^SERIES_INST ') | first | default('SERIES_INST ?')) | regex_replace('^SERIES_INST ','') }}"
+        db_series_cand: "{{ (a.stdout_lines | select('match','^SERIES_CAND ') | first | default('SERIES_CAND ?')) | regex_replace('^SERIES_CAND ','') }}"
+        db_pkgs: "{{ ((a.stdout_lines | select('match','^PKGS ') | first | default('PKGS ')) | regex_replace('^PKGS ?','')).split() }}"
+
+    - name: Prikazi plan
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: PostgreSQL {{ db_installed }} -> {{ db_candidate }} (serija {{ db_series_inst }} -> {{ db_series_cand }})"
+
+    - name: SIGURNOSNA BRANA — prekini ako bi se promijenila major-serija
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }}: kandidat {{ db_candidate }} je DRUGA serija ({{ db_series_cand }})
+          od instalirane ({{ db_series_inst }}). To bi bio skok major verzije -- prekidam.
+          Provjeri pinanje repozitorija; major nadogradnju radi zasebno i planirano.
+      when:
+        - db_candidate not in ['none', '']
+        - db_series_cand not in ['', '?']
+        - db_series_inst != db_series_cand
+
+    - name: Vec na najnovijoj patch verziji — nema sto za nadograditi
+      ansible.builtin.meta: end_host
+      when: db_candidate in ['none', ''] or db_installed == db_candidate
+
+    - name: dry_run — samo plan, bez izmjena
+      ansible.builtin.meta: end_host
+      when: dry_run | bool
+
+    - name: Nadogradi (samo instalirane pakete, unutar serije)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --only-upgrade \
+            -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef \
+            {{ db_pkgs | join(' ') }}
+      register: db_upgrade
+
+    - name: Restartaj servis da se patch aktivira
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          for s in {{ services | join(' ') }}; do
+            if systemctl cat "$s" >/dev/null 2>&1; then systemctl restart "$s" && echo "restartan $s"; fi
+          done
+      register: db_restart
+      when: restart_after | bool
+      changed_when: "'restartan' in db_restart.stdout"
+
+    - name: Verzija nakon
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: "dpkg-query -W -f='${Version}' $(echo '{{ db_pkgs | join(' ') }}' | tr ' ' '\n' | grep -E 'server' | head -n1) 2>/dev/null || true"
+      register: after
+      changed_when: false
+      failed_when: false
+
+    - name: Sazetak
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: PostgreSQL nadogradjen {{ db_installed }} -> {{ after.stdout | default('?') }} ; restart: {{ db_restart.stdout | default('(preskocen)') }}"

@@ -1,0 +1,77 @@
+---
+# Nadogradnja Docker-a na zadnju dostupnu verziju (bez ogranicenja serije).
+# Nadograduje samo instalirane docker pakete. Restart docker daemona ukratko
+# prekida rad kontejnera -> serial=1, default target iskljucuje produkciju.
+
+- name: Nadogradnja Docker
+  hosts: "{{ target | default('docker:!produkcija') }}"
+  become: true
+  gather_facts: false
+  serial: "{{ docker_serial | default(1) }}"
+
+  vars:
+    dry_run: false
+    restart_after: true
+
+  tasks:
+    - name: Nadji instalirane docker pakete i verziju prije
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          PKGS=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'docker*' 'containerd*' 2>/dev/null | awk '$1 ~ /^ii/{print $2}' | sort -u | tr '\n' ' ')
+          if [ -z "$(echo $PKGS | tr -d ' ')" ]; then echo "RESULT ABSENT"; exit 0; fi
+          VER=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+          echo "RESULT PRESENT"
+          echo "VER ${VER:-unknown}"
+          echo "PKGS $PKGS"
+      register: a
+      changed_when: false
+      failed_when: false
+
+    - name: Preskoci ako docker nije instaliran
+      ansible.builtin.meta: end_host
+      when: (a.stdout_lines | default([]) | select('match','^RESULT ABSENT') | list | length) > 0 or a is unreachable
+
+    - name: Rasclani
+      ansible.builtin.set_fact:
+        docker_ver: "{{ (a.stdout_lines | select('match','^VER ') | first | default('VER ?')) | regex_replace('^VER ','') }}"
+        docker_pkgs: "{{ ((a.stdout_lines | select('match','^PKGS ') | first | default('PKGS ')) | regex_replace('^PKGS ?','')).split() }}"
+
+    - name: Prikazi plan
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Docker {{ docker_ver }} -> nadogradnja na zadnju dostupnu ({{ docker_pkgs | join(', ') }})"
+
+    - name: dry_run — samo plan
+      ansible.builtin.meta: end_host
+      when: dry_run | bool
+
+    - name: Osvjezi cache i nadogradi docker pakete
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq || true
+          apt-get install -y --only-upgrade \
+            -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef \
+            {{ docker_pkgs | join(' ') }}
+      register: docker_upgrade
+
+    - name: Restartaj docker (ako je trazeno)
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      when: restart_after | bool
+
+    - name: Verzija nakon
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: "docker --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -n1 || true"
+      register: after
+      changed_when: false
+      failed_when: false
+
+    - name: Sazetak
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Docker {{ docker_ver }} -> {{ after.stdout | default('?') }}"
