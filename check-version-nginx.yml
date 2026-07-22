@@ -1,0 +1,51 @@
+---
+# Provjera verzije: nginx
+# Read-only. Ispisuje verziju po hostu; hostove bez nginx preskace/oznaci.
+# Default target je 'all' (moze se nadjaci sa survey/extra var 'target').
+
+- name: Provjera verzije nginx
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Ocitaj verziju
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          if command -v nginx >/dev/null 2>&1; then
+            v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            echo "VERINFO ${v:-unknown}"
+          else echo "VERINFO ABSENT"; fi
+      register: v
+      changed_when: false
+      failed_when: false
+
+    - name: Izvuci oznacenu liniju
+      ansible.builtin.set_fact:
+        _verline: "{{ v.stdout_lines | select('match','^VERINFO ') | first | default('VERINFO ABSENT') }}"
+      when: v is not unreachable
+
+    - name: Zapamti verziju (samo ako je instaliran)
+      ansible.builtin.set_fact:
+        sw_version: "{{ _verline | regex_replace('^VERINFO ','') }}"
+      when:
+        - v is not unreachable
+        - _verline != 'VERINFO ABSENT'
+
+    - name: Prikazi po hostu
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: nginx {{ sw_version if sw_version is defined else 'nije instaliran' }}"
+
+    - name: Sazetak — hostovi po verziji
+      run_once: true
+      vars:
+        present: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('sw_version','defined') | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }} ({{ present | selectattr('sw_version','equalto', item) | list | length }}):
+          {{ present | selectattr('sw_version','equalto', item) | map(attribute='inventory_hostname') | join(', ') }}
+      loop: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('sw_version','defined') | map(attribute='sw_version') | unique | sort | list }}"
+      loop_control:
+        label: "{{ item }}"
