@@ -1,0 +1,83 @@
+---
+# Nadogradnja/patchiranje Oracle Linux (i opcenito RHEL-family EL8/EL9) preko dnf.
+# Ostaje unutar postojeceg majora (repoi su vezani na OL9 -> nema skoka na OL10).
+# Ne-RedHat-family hostovi se uredno preskacu.
+#
+# Opcije:
+#   security_only: true  -> primijeni SAMO sigurnosne errata (dnf --security)
+#   allow_reboot:  true  -> rebootaj ako je potrebno (npr. novi kernel)
+# Default target iskljucuje produkciju; serial=1 za kontrolirani rollout.
+#
+# NAPOMENA: za EL7 (centos7/rhel7 -> yum) treba zasebna 'yum' varijanta.
+
+- name: Nadogradnja Oracle Linux (dnf)
+  hosts: "{{ target | default('ol9:!produkcija') }}"
+  become: true
+  gather_facts: true
+  serial: "{{ el_serial | default(1) }}"
+
+  vars:
+    security_only: false      # true = samo sigurnosni updatei
+    autoremove: true
+    allow_reboot: false       # rebootaj ako je potrebno
+    reboot_timeout: 600
+
+  tasks:
+    - name: Preskoci host koji nije RHEL-family (nema dnf)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_major_version'] }} nije RHEL-family — preskacem."
+      when: ansible_facts['os_family'] != 'RedHat'
+
+    - name: Zavrsi na ne-RHEL hostu
+      ansible.builtin.meta: end_host
+      when: ansible_facts['os_family'] != 'RedHat'
+
+    - name: Potvrdi RHEL-family
+      ansible.builtin.debug:
+        msg: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_major_version'] }} potvrdjen, nastavljam."
+
+    - name: Osiguraj dnf-utils (za needs-restarting)
+      ansible.builtin.dnf:
+        name: dnf-utils
+        state: present
+        update_cache: true
+
+    - name: Primijeni updatee ({{ 'samo sigurnosni' if security_only | bool else 'svi' }})
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        security: "{{ security_only | bool }}"
+        update_cache: true
+      register: dnf_update
+
+    - name: Ukloni nepotrebne pakete (autoremove)
+      ansible.builtin.dnf:
+        autoremove: true
+      when: autoremove | bool
+
+    - name: Provjeri treba li reboot
+      ansible.builtin.command: needs-restarting -r
+      register: nr
+      changed_when: false
+      failed_when: false
+
+    - name: Prikazi status reboota
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'REBOOT POTREBAN' if nr.rc == 1 else ('reboot nije potreban' if nr.rc == 0 else 'needs-restarting nedostupan (rc=' ~ nr.rc ~ ')') }}
+
+    - name: Rebootaj ako je potrebno i dopusteno
+      ansible.builtin.reboot:
+        msg: "Reboot iz Ansible nakon dnf update"
+        reboot_timeout: "{{ reboot_timeout }}"
+      when:
+        - allow_reboot | bool
+        - nr.rc == 1
+
+    - name: Sazetak
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'promjene primijenjene' if dnf_update.changed else 'nista za nadograditi' }};
+          reboot: {{ 'napravljen' if (allow_reboot | bool and nr.rc == 1) else ('potreban - rucno' if nr.rc == 1 else 'nije potreban') }}
