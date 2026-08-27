@@ -1,0 +1,50 @@
+---
+# Revizija korisnika (UID > 999) na Linux/FreeBSD serverima.
+# Read-only: samo cita korisnike, nista ne mijenja/brise.
+# Radi preko 'raw' (ne treba Python na cilju) i shell-agnosticno (i csh na FreeBSD-u).
+# Rezultat: popis svih RAZLICITIH korisnika + na kojim se hostovima javljaju.
+
+- name: Revizija korisnika (UID > 999)
+  hosts: "{{ target | default('all') }}"
+  become: false
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Procitaj korisnike s UID > 999
+      ansible.builtin.raw: |
+        /bin/sh -c 'src=$(command -v getent >/dev/null 2>&1 && getent passwd || cat /etc/passwd); printf "%s\n" "$src" | awk -F: "\$3+0>999{print \"USERLINE \" \$1 \" \" \$3}"'
+      register: pw
+      changed_when: false
+      failed_when: false
+
+    - name: Rasclani korisnike ovog hosta
+      ansible.builtin.set_fact:
+        audit_users: "{{ pw.stdout_lines | default([]) | select('match','^USERLINE ') | map('regex_replace','^USERLINE ([^ ]+) .*$','\\1') | list }}"
+      when: pw is not unreachable
+
+    - name: Prikazi korisnike po hostu
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ({{ audit_users | length }}): {{ audit_users | sort | join(', ') if audit_users else '(nema korisnika s UID>999)' }}"
+      when: audit_users is defined
+
+    - name: Popis SVIH razlicitih korisnika na floti
+      run_once: true
+      vars:
+        per_host: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('audit_users','defined') | list }}"
+        svi: "{{ per_host | map(attribute='audit_users') | flatten | unique | sort }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['=== Razliciti korisnici (UID>999): ' ~ (svi | length) ~ ' ==='] + svi }}
+
+    - name: Po korisniku — na kojim hostovima se javlja
+      run_once: true
+      vars:
+        per_host: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('audit_users','defined') | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }} ({{ per_host | selectattr('audit_users','contains', item) | list | length }}):
+          {{ per_host | selectattr('audit_users','contains', item) | map(attribute='inventory_hostname') | sort | join(', ') }}
+      loop: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('audit_users','defined') | map(attribute='audit_users') | flatten | unique | sort }}"
+      loop_control:
+        label: "{{ item }}"
