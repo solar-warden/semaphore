@@ -5,7 +5,7 @@
 # Read-only za sustav (osvjezava samo apt cache), ne instalira nista.
 
 - name: Apt update s provjerom repozitorija
-  hosts: "{{ target | default('all') }}"
+  hosts: "{{ target | default('debian_svi:!produkcija') }}"
   become: true
   gather_facts: false
 
