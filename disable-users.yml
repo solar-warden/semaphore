@@ -20,7 +20,7 @@
   vars:
     disable_users: []                       # <-- popis korisnika za onemoguciti
     min_uid: 1000
-    protected_users: ['root', 'ansible', 'mjunusic']    # nikad ne diraj (dodaj svoj admin nalog!)
+    protected_users: ['root', 'ansible']    # nikad ne diraj (dodaj svoj admin nalog!)
 
   tasks:
     - name: Provjeri da je popis zadan
@@ -39,11 +39,18 @@
           MIN_UID={{ min_uid }}
           PROT=" {{ protected_users | join(' ') }} "
 
+          # "vec onemogucen" = i zakljucan (lozinka) I istekao racun.
+          # Ako je samo jedno (npr. L bez isteka), NIJE dovoljno -> dovrsi ga.
           already_locked() {
             if [ "$OS" = "FreeBSD" ]; then
-              pw usershow "$1" 2>/dev/null | awk -F: '{print $2}' | grep -q '^\*LOCKED\*'
+              locked=$(pw usershow "$1" 2>/dev/null | awk -F: '{print $2}' | grep -q '^\*LOCKED\*' && echo y || echo n)
+              # istek: polje 7 (expire) u pw usershow; prazno/0 = bez isteka
+              expf=$(pw usershow "$1" 2>/dev/null | awk -F: '{print $7}')
+              [ "$locked" = "y" ] && [ -n "$expf" ] && [ "$expf" != "0" ]
             else
-              [ "$(passwd -S "$1" 2>/dev/null | awk '{print $2}')" = "L" ]
+              locked=$([ "$(passwd -S "$1" 2>/dev/null | awk '{print $2}')" = "L" ] && echo y || echo n)
+              exp=$(chage -l "$1" 2>/dev/null | awk -F: '/[Aa]ccount expires/{print $2}' | xargs)
+              [ "$locked" = "y" ] && [ -n "$exp" ] && [ "$exp" != "never" ]
             fi
           }
 
