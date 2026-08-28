@@ -20,7 +20,7 @@
   vars:
     disable_users: []                       # <-- popis korisnika za onemoguciti
     min_uid: 1000
-    protected_users: ['root', 'ansible']    # nikad ne diraj (dodaj svoj admin nalog!)
+    protected_users: ['root', 'ansible', 'mjunusic']    # nikad ne diraj (dodaj svoj admin nalog!)
 
   tasks:
     - name: Provjeri da je popis zadan
