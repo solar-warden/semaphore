@@ -1,0 +1,59 @@
+---
+# Provjeri je li FreeSWITCH pokrenut; ako nije -> systemctl start freeswitch.
+# Idempotentno: hostove gdje vec radi ne dira. Hostove bez systemd/servisa
+# (npr. FreeBSD ili gdje FS nije instaliran) uredno preskace.
+#
+# Napomena: systemctl je Linux/systemd. Na FreeBSD-u se preskace (nema systemctl).
+
+- name: Osiguraj da FreeSWITCH radi
+  hosts: "{{ target | default('freeswitch_nodes') }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Provjeri postoji li servis i je li aktivan
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          if command -v systemctl >/dev/null 2>&1 && systemctl cat freeswitch >/dev/null 2>&1; then
+            echo "STATE $(systemctl is-active freeswitch 2>/dev/null)"
+          else
+            echo "STATE NOUNIT"
+          fi
+      register: st
+      changed_when: false
+      failed_when: false
+
+    - name: Zapamti stanje
+      ansible.builtin.set_fact:
+        fs_state: "{{ (st.stdout_lines | select('match','^STATE ') | first | default('STATE unknown')) | regex_replace('^STATE ','') }}"
+      when: st is not unreachable
+
+    - name: Preskoci host bez systemd/servisa freeswitch
+      ansible.builtin.meta: end_host
+      when: fs_state is not defined or fs_state == 'NOUNIT'
+
+    - name: Prikazi zatecno stanje
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: FreeSWITCH je {{ 'AKTIVAN' if fs_state == 'active' else 'NIJE aktivan (' ~ fs_state ~ ')' }}"
+
+    - name: Pokreni FreeSWITCH ako nije aktivan
+      ansible.builtin.systemd:
+        name: freeswitch
+        state: started
+      register: fs_start
+      when: fs_state != 'active'
+
+    - name: Provjeri stanje nakon pokretanja
+      ansible.builtin.command: systemctl is-active freeswitch
+      register: fs_after
+      changed_when: false
+      failed_when: false
+      when: fs_state != 'active'
+
+    - name: Rezultat
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'vec je radio - nista nije poduzeto' if fs_state == 'active'
+             else ('POKRENUT, sada: ' ~ (fs_after.stdout | default('?'))) }}
