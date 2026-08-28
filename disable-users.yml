@@ -1,0 +1,93 @@
+---
+# Onemogucavanje (disable) korisnika na Linux/FreeBSD serverima.
+# Ulaz: disable_users (popis korisnickih imena).
+# Za svakog korisnika, NA SVAKOM hostu: ako postoji -> zakljucaj + istekni racun.
+# NE brise korisnika (reverzibilno). Blokira i lozinku i SSH-kljuc login.
+#
+# ZASTITE:
+#   - nikad ne dira root (uid 0)
+#   - preskace protected_users (default root, ansible)
+#   - preskace racune s uid < min_uid (default 1000 = sistemski korisnici)
+#   - ako korisnik ne postoji na hostu -> preskace ga
+#
+# Za ponovno omogucavanje kasnije: usermod -U -e '' <user> (Linux) / pw unlock (FreeBSD).
+
+- name: Onemoguci korisnike (Linux/FreeBSD)
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    disable_users: []                       # <-- popis korisnika za onemoguciti
+    min_uid: 1000
+    protected_users: ['root', 'ansible']    # nikad ne diraj (dodaj svoj admin nalog!)
+
+  tasks:
+    - name: Provjeri da je popis zadan
+      ansible.builtin.assert:
+        that: (disable_users | length) > 0
+        fail_msg: "disable_users je prazan — zadaj popis korisnika (npr. -e '{\"disable_users\":[\"pero\",\"iva\"]}')."
+      run_once: true
+      delegate_to: localhost
+
+    - name: Onemoguci korisnike koji postoje
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uf
+          OS=$(uname -s)
+          MIN_UID={{ min_uid }}
+          PROT=" {{ protected_users | join(' ') }} "
+
+          already_locked() {
+            if [ "$OS" = "FreeBSD" ]; then
+              pw usershow "$1" 2>/dev/null | awk -F: '{print $2}' | grep -q '^\*LOCKED\*'
+            else
+              [ "$(passwd -S "$1" 2>/dev/null | awk '{print $2}')" = "L" ]
+            fi
+          }
+
+          for u in {{ disable_users | join(' ') }}; do
+            if ! id -u "$u" >/dev/null 2>&1; then echo "OUT $u absent"; continue; fi
+            uid=$(id -u "$u" 2>/dev/null)
+            if [ "$uid" = "0" ]; then echo "OUT $u skip-root"; continue; fi
+            case "$PROT" in *" $u "*) echo "OUT $u protected"; continue;; esac
+            if [ "$uid" -lt "$MIN_UID" ]; then echo "OUT $u skip-uid($uid)"; continue; fi
+            if already_locked "$u"; then echo "OUT $u already-disabled(uid=$uid)"; continue; fi
+
+            if [ "$OS" = "FreeBSD" ]; then
+              pw lock "$u" >/dev/null 2>&1 || true
+              exp=$(date -v-1d +%d-%b-%Y 2>/dev/null || echo 01-Jan-1970)
+              pw usermod "$u" -e "$exp" >/dev/null 2>&1 || true
+            else
+              usermod -L "$u" >/dev/null 2>&1 || true
+              usermod -s /usr/sbin/nologin "$u" >/dev/null 2>&1 || true
+              chage -E 0 "$u" >/dev/null 2>&1 || usermod -e 1 "$u" >/dev/null 2>&1 || true
+            fi
+            echo "OUT $u DISABLED(uid=$uid)"
+          done
+      register: dis
+      changed_when: "'DISABLED(' in dis.stdout"
+      failed_when: false
+
+    - name: Prikazi rezultat po hostu
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} => {{ dis.stdout_lines | select('match','^OUT ') | map('regex_replace','^OUT ','') | list }}"
+
+    - name: Sazetak — gdje je tko stvarno onemogucen
+      run_once: true
+      vars:
+        rows: >-
+          {{ ansible_play_hosts | map('extract', hostvars)
+             | selectattr('dis','defined') | list }}
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['=== Onemoguceni (po hostu) ==='] +
+             (rows | map(attribute='inventory_hostname') | zip(
+                rows | map(attribute='dis')
+                     | map(attribute='stdout_lines')
+                     | map('select','search','DISABLED')
+                     | map('map','regex_replace','^OUT ','')
+                     | map('map','regex_replace',' DISABLED.*$','')
+                     | map('join', ', ') )
+              | map('join', ': ') | list) }}
