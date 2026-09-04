@@ -1,0 +1,33 @@
+#!/bin/bash
+# /etc/ansible/facts.d/services.fact
+# Ansible local fact: verzije instaliranih servisa -> ansible_local.services.*
+# Mora ispisati valjan JSON na stdout.
+set -f
+OUT=""
+add() { local k="$1" v="$2"; [ -z "$v" ] && return
+  [ -n "$OUT" ] && OUT="$OUT,"; OUT="$OUT\"$k\":\"$v\""; }
+
+# OS
+if [ -r /etc/os-release ]; then . /etc/os-release
+  add os "${ID}${VERSION_ID%%.*}"; add os_pretty "$PRETTY_NAME"
+elif [ "$(uname -s)" = "FreeBSD" ]; then
+  add os "freebsd$(freebsd-version 2>/dev/null | cut -d. -f1)"; add os_pretty "FreeBSD $(freebsd-version 2>/dev/null)"
+fi
+
+# baze / servisi
+for b in mysqld mariadbd /usr/sbin/mysqld /usr/sbin/mariadbd; do
+  if command -v "$b" >/dev/null 2>&1 || [ -x "$b" ]; then
+    add mysql "$("$b" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; break; fi
+done
+command -v mongod  >/dev/null 2>&1 && add mongodb    "$(mongod --version 2>/dev/null | grep -oE 'v[0-9.]+' | head -n1 | tr -d v)"
+command -v docker  >/dev/null 2>&1 && add docker     "$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+command -v pg_lsclusters >/dev/null 2>&1 && add postgresql "$(pg_lsclusters -h 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, -)"
+command -v nginx   >/dev/null 2>&1 && add nginx      "$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+command -v php     >/dev/null 2>&1 && add php        "$(php -v 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+command -v fs_cli  >/dev/null 2>&1 && add freeswitch "$(dpkg-query -W -f='${Version}' freeswitch 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+
+# custom (paketi)
+v=$(dpkg-query -W -f='${Version}' agentproxy 2>/dev/null);   add agentproxy   "$v"
+v=$(dpkg-query -W -f='${Version}' voicebrowser 2>/dev/null); add voicebrowser "$v"
+
+echo "{$OUT}"

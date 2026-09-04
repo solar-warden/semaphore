@@ -1,0 +1,30 @@
+---
+# Deploya local-fact skriptu na hostove, pa se verzije servisa pojave
+# u 'ansible -m setup' izlazu pod ansible_local.services.* (za ansible-cmdb).
+# Skripta 'services.fact' mora biti u istom repo/direktoriju kao ovaj playbook.
+
+- name: Deploy service-version local facts
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Osiguraj /etc/ansible/facts.d
+      ansible.builtin.file:
+        path: /etc/ansible/facts.d
+        state: directory
+        mode: '0755'
+
+    - name: Kopiraj services.fact
+      ansible.builtin.copy:
+        src: services.fact
+        dest: /etc/ansible/facts.d/services.fact
+        mode: '0755'
+
+    - name: Osvjezi facts (ucitaj nove local facts)
+      ansible.builtin.setup:
+        filter: ansible_local
+
+    - name: Prikazi sto je detektirano
+      ansible.builtin.debug:
+        var: ansible_local.services
