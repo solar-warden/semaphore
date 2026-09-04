@@ -1,0 +1,73 @@
+---
+# Izvozi trenutni (Semaphore) inventory u DVIJE staticke datoteke na kontroleru:
+#   /var/lib/cmdb/inventory.yml  -> za 'ansible -m setup' gather (i druge playbookove)
+#   /var/lib/cmdb/inventory.ini  -> za ansible-cmdb (YAML mu ne odgovara)
+# Pokreni kao Semaphore task s NJEGOVIM inventoryjem.
+
+- name: Izvezi inventory (YAML + INI)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    out_dir:  /var/lib/cmdb
+    yml_out:  "{{ out_dir }}/inventory.yml"
+    ini_out:  "{{ out_dir }}/inventory.ini"
+
+  tasks:
+    - name: Osiguraj ciljni direktorij
+      ansible.builtin.file:
+        path: "{{ out_dir }}"
+        state: directory
+        mode: '0755'
+      become: true
+
+    # ---------- YAML (stablo grupa: children + hosts) ----------
+    - name: Generiraj YAML inventory
+      ansible.builtin.copy:
+        dest: "{{ yml_out }}"
+        mode: '0644'
+        content: |
+          # Automatski generirano iz Semaphore inventoryja - NE uredjuj rucno.
+          all:
+            children:
+          {% for group in groups.keys() | reject('equalto','all') | reject('equalto','ungrouped') | sort %}
+          {% if groups[group] | length > 0 %}
+              {{ group }}:
+                hosts:
+          {% for h in groups[group] | sort %}
+                  {{ h }}:{% if hostvars[h].ansible_user is defined %} {ansible_user: {{ hostvars[h].ansible_user }}}{% endif %}
+
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+      become: true
+
+    # ---------- INI (grupe + hostovi) ----------
+    - name: Generiraj INI inventory
+      ansible.builtin.copy:
+        dest: "{{ ini_out }}"
+        mode: '0644'
+        content: |
+          # Automatski generirano iz Semaphore inventoryja - NE uredjuj rucno.
+          {% for group in groups.keys() | reject('equalto','all') | reject('equalto','ungrouped') | sort %}
+          {% if groups[group] | length > 0 %}
+          [{{ group }}]
+          {% for h in groups[group] | sort %}
+          {{ h }}{% if hostvars[h].ansible_user is defined %} ansible_user={{ hostvars[h].ansible_user }}{% endif %}
+
+          {% endfor %}
+
+          {% endif %}
+          {% endfor %}
+      become: true
+
+    - name: Provjeri da je YAML valjan
+      ansible.builtin.command: "python3 -c \"import yaml; yaml.safe_load(open('{{ yml_out }}'))\""
+      changed_when: false
+
+    - name: Sazetak
+      ansible.builtin.debug:
+        msg: >-
+          YAML: {{ yml_out }} | INI: {{ ini_out }} |
+          hostova: {{ groups['all'] | length }} |
+          grupa: {{ groups.keys() | reject('equalto','all') | list | length }}
