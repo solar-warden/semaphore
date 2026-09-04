@@ -22,7 +22,11 @@ done
 command -v mongod  >/dev/null 2>&1 && add mongodb    "$(mongod --version 2>/dev/null | grep -oE 'v[0-9.]+' | head -n1 | tr -d v)"
 command -v docker  >/dev/null 2>&1 && add docker     "$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 command -v pg_lsclusters >/dev/null 2>&1 && add postgresql "$(pg_lsclusters -h 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, -)"
-command -v nginx   >/dev/null 2>&1 && add nginx      "$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+NGINX=""
+for p in nginx /usr/sbin/nginx /sbin/nginx /usr/local/sbin/nginx; do
+  if command -v "$p" >/dev/null 2>&1 || [ -x "$p" ]; then NGINX="$p"; break; fi
+done
+[ -n "$NGINX" ] && add nginx "$("$NGINX" -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 command -v php     >/dev/null 2>&1 && add php        "$(php -v 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 command -v fs_cli  >/dev/null 2>&1 && add freeswitch "$(dpkg-query -W -f='${Version}' freeswitch 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 
