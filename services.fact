@@ -1,37 +1,61 @@
-#!/bin/bash
+#!/bin/sh
 # /etc/ansible/facts.d/services.fact
-# Ansible local fact: verzije instaliranih servisa -> ansible_local.services.*
-# Mora ispisati valjan JSON na stdout.
-set -f
-OUT=""
-add() { local k="$1" v="$2"; [ -z "$v" ] && return
-  [ -n "$OUT" ] && OUT="$OUT,"; OUT="$OUT\"$k\":\"$v\""; }
+# Univerzalni local fact: verzije servisa iz PAKETA (Debian/RHEL/OL/FreeBSD).
+# POSIX sh. Primarno paketni upit; binary --version samo kao rezerva.
+# Ispisuje JSON -> ansible_local.services.*
 
-# OS
-if [ -r /etc/os-release ]; then . /etc/os-release
-  add os "${ID}${VERSION_ID%%.*}"; add os_pretty "$PRETTY_NAME"
-elif [ "$(uname -s)" = "FreeBSD" ]; then
-  add os "freebsd$(freebsd-version 2>/dev/null | cut -d. -f1)"; add os_pretty "FreeBSD $(freebsd-version 2>/dev/null)"
+OS=$(uname -s)
+OUT=""
+add() { [ -z "$2" ] && return; [ -n "$OUT" ] && OUT="$OUT,"; OUT="$OUT\"$1\":\"$2\""; }
+ver()  { echo "$1" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1; }   # izvuci x.y(.z)
+
+# --- verzija paketa po imenu; prima vise kandidata imena, uzima prvi instaliran ---
+pkgver() {
+  for name in "$@"; do
+    case "$OS" in
+      Linux)
+        if command -v dpkg-query >/dev/null 2>&1; then
+          v=$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}\n' "$name" 2>/dev/null | awk '$1 ~ /^ii/{print $2; exit}')
+        elif command -v rpm >/dev/null 2>&1; then
+          v=$(rpm -q --qf '%{VERSION}\n' "$name" 2>/dev/null | grep -vi 'not installed' | head -n1)
+        fi ;;
+      FreeBSD)
+        v=$(pkg query '%v' "$name" 2>/dev/null | head -n1) ;;
+    esac
+    [ -n "$v" ] && { ver "$v"; return 0; }
+  done
+}
+
+# --- rezerva: binary --version u uobicajenim putanjama ---
+binver() {
+  bin="$1"; shift
+  for p in "$bin" /usr/sbin/"$bin" /sbin/"$bin" /usr/bin/"$bin" /bin/"$bin" \
+           /usr/local/sbin/"$bin" /usr/local/bin/"$bin"; do
+    if command -v "$p" >/dev/null 2>&1 || [ -x "$p" ]; then
+      ver "$("$p" "$@" 2>&1)"; return 0
+    fi
+  done
+}
+
+# ---------------- OS ----------------
+if [ -r /etc/os-release ]; then
+  . /etc/os-release; add os "${ID}${VERSION_ID%%.*}"; add os_pretty "$PRETTY_NAME"
+elif [ "$OS" = "FreeBSD" ]; then
+  fv=$(freebsd-version 2>/dev/null); add os "freebsd${fv%%.*}"; add os_pretty "FreeBSD $fv"
+elif [ -r /etc/redhat-release ]; then
+  add os_pretty "$(cat /etc/redhat-release)"
 fi
 
-# baze / servisi
-for b in mysqld mariadbd /usr/sbin/mysqld /usr/sbin/mariadbd; do
-  if command -v "$b" >/dev/null 2>&1 || [ -x "$b" ]; then
-    add mysql "$("$b" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; break; fi
-done
-command -v mongod  >/dev/null 2>&1 && add mongodb    "$(mongod --version 2>/dev/null | grep -oE 'v[0-9.]+' | head -n1 | tr -d v)"
-command -v docker  >/dev/null 2>&1 && add docker     "$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-command -v pg_lsclusters >/dev/null 2>&1 && add postgresql "$(pg_lsclusters -h 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, -)"
-NGINX=""
-for p in nginx /usr/sbin/nginx /sbin/nginx /usr/local/sbin/nginx; do
-  if command -v "$p" >/dev/null 2>&1 || [ -x "$p" ]; then NGINX="$p"; break; fi
-done
-[ -n "$NGINX" ] && add nginx "$("$NGINX" -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-command -v php     >/dev/null 2>&1 && add php        "$(php -v 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-command -v fs_cli  >/dev/null 2>&1 && add freeswitch "$(dpkg-query -W -f='${Version}' freeswitch 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-
-# custom (paketi)
-v=$(dpkg-query -W -f='${Version}' agentproxy 2>/dev/null);   add agentproxy   "$v"
-v=$(dpkg-query -W -f='${Version}' voicebrowser 2>/dev/null); add voicebrowser "$v"
+# ---------------- servisi (paket -> rezerva binary) ----------------
+# ime paketa se razlikuje po OS-u, pa navodim vise kandidata:
+add nginx      "$(pkgver nginx || binver nginx -v)"
+add docker     "$(pkgver docker-ce docker docker.io || binver docker --version)"
+add php        "$(pkgver php php-cli php8.2-cli php8.1-cli php83 php82 php81 || binver php -v)"
+add mysql      "$(pkgver mysql-community-server mysql-server mysql57-server mysql80-server || binver mysqld --version)"
+add mongodb    "$(pkgver mongodb-org-server mongodb-org mongodb || binver mongod --version)"
+add postgresql "$(pkgver postgresql postgresql-server postgresql16-server postgresql15-server postgresql14-server || binver postgres --version)"
+add freeswitch "$(pkgver freeswitch || binver freeswitch -version)"
+add agentproxy "$(pkgver agentproxy)"
+add voicebrowser "$(pkgver voicebrowser)"
 
 echo "{$OUT}"
