@@ -1,0 +1,47 @@
+---
+# Restart zabbix-agent2 servisa (systemd).
+# Preskace hostove gdje servis ne postoji ili nije systemd (npr. FreeBSD).
+
+- name: Restart zabbix-agent2
+  hosts: "{{ target | default('debian12') }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Provjeri postoji li servis zabbix-agent2
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          if command -v systemctl >/dev/null 2>&1 && systemctl cat zabbix-agent2 >/dev/null 2>&1; then
+            echo "STATE $(systemctl is-active zabbix-agent2 2>/dev/null)"
+          else
+            echo "STATE NOUNIT"
+          fi
+      register: st
+      changed_when: false
+      failed_when: false
+
+    - name: Preskoci host bez servisa zabbix-agent2
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: nema systemd servisa zabbix-agent2 — preskacem."
+      when: (st.stdout_lines | select('match','^STATE NOUNIT') | list | length) > 0 or st is unreachable
+
+    - name: Zavrsi na hostu bez servisa
+      ansible.builtin.meta: end_host
+      when: (st.stdout_lines | select('match','^STATE NOUNIT') | list | length) > 0 or st is unreachable
+
+    - name: Restartaj zabbix-agent2
+      ansible.builtin.systemd:
+        name: zabbix-agent2
+        state: restarted
+      register: zbx
+
+    - name: Provjeri stanje nakon restarta
+      ansible.builtin.command: systemctl is-active zabbix-agent2
+      register: after
+      changed_when: false
+      failed_when: false
+
+    - name: Rezultat
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: zabbix-agent2 restartan, sada: {{ after.stdout | default('?') }}"
