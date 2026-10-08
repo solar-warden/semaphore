@@ -1,0 +1,104 @@
+---
+# Provjeri vrti li mongod zadnju INSTALIRANU verziju; ako vrti STARU -> restart.
+# Usporeduje: verziju binarija na disku (instalirano) vs verziju koju zivi proces vrti.
+# Dvije metode (auth-safe): db.version() preko klijenta, te /proc/<pid>/exe "(deleted)".
+#
+# serial=1 + default iskljucuje produkciju (restart mongo = kratak prekid konekcija).
+
+- name: Restart MongoDB ako se vrti stara verzija
+  hosts: "{{ target | default('mongo:!produkcija') }}"
+  become: true
+  gather_facts: false
+  serial: "{{ mongo_serial | default(1) }}"
+
+  vars:
+    allow_restart: true
+
+  tasks:
+    - name: Analiza (verzija na disku vs verzija u procesu)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uf
+          # verzija binarija NA DISKU (= instalirana nakon nadogradnje paketa)
+          DISK=$(mongod --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | tr -d v)
+          # pokrenuti mongod?
+          PID=$(pgrep -x mongod 2>/dev/null | head -n1)
+          if [ -z "$PID" ]; then
+            echo "RESULT NOTRUNNING"; echo "DISK ${DISK:-unknown}"; exit 0
+          fi
+          # verzija koju proces STVARNO vrti (preko klijenta; radi i bez autha na vecini setupa)
+          RUN=""
+          for cli in mongosh mongo; do
+            if command -v "$cli" >/dev/null 2>&1; then
+              RUN=$("$cli" --quiet --eval 'db.version()' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+              [ -n "$RUN" ] && break
+            fi
+          done
+          # je li binary iz kojeg proces radi zamijenjen na disku? (auth-free signal)
+          DELETED=no
+          ls -l /proc/"$PID"/exe 2>/dev/null | grep -q '(deleted)' && DELETED=yes
+          echo "RESULT RUNNING"
+          echo "DISK ${DISK:-unknown}"
+          echo "RUN ${RUN:-unknown}"
+          echo "DELETED $DELETED"
+      register: a
+      changed_when: false
+      failed_when: false
+
+    - name: Rasclani
+      ansible.builtin.set_fact:
+        m_running: "{{ (a.stdout_lines | select('match','^RESULT RUNNING') | list | length) > 0 }}"
+        m_disk: "{{ (a.stdout_lines | select('match','^DISK ') | first | default('DISK unknown')) | regex_replace('^DISK ','') }}"
+        m_run: "{{ (a.stdout_lines | select('match','^RUN ') | first | default('RUN unknown')) | regex_replace('^RUN ','') }}"
+        m_deleted: "{{ (a.stdout_lines | select('match','^DELETED yes') | list | length) > 0 }}"
+
+    - name: Odredi je li proces zastario (stale)
+      ansible.builtin.set_fact:
+        m_stale: >-
+          {{ m_running and (
+                (m_run not in ['unknown',''] and m_run != m_disk)
+                or (m_run in ['unknown',''] and m_deleted)
+             ) }}
+
+    - name: Prikazi stanje
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'mongod NIJE pokrenut' if not m_running
+             else ('na disku ' ~ m_disk ~ ', vrti se ' ~ m_run ~
+                   (' | ZASTARJELO -> treba restart' if m_stale else ' | OK (zadnja verzija)')) }}
+
+    - name: Restartaj mongod (samo ako vrti staru verziju)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          for s in mongod mongodb; do
+            if systemctl cat "$s" >/dev/null 2>&1; then systemctl restart "$s" && echo "restarted $s"; break; fi
+          done
+      register: m_restart
+      when:
+        - allow_restart | bool
+        - m_stale | bool
+      changed_when: "'restarted' in m_restart.stdout"
+
+    - name: Provjeri verziju nakon restarta
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          for cli in mongosh mongo; do
+            if command -v "$cli" >/dev/null 2>&1; then
+              "$cli" --quiet --eval 'db.version()' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 && exit 0
+            fi
+          done
+      register: m_after
+      changed_when: false
+      failed_when: false
+      when: m_stale | bool
+
+    - name: Sazetak
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ ('restartan -> sada vrti ' ~ (m_after.stdout | default('?'))) if m_stale
+             else ('bez promjene (' ~ ('nije pokrenut' if not m_running else 'vec zadnja verzija ' ~ m_disk) ~ ')') }}
